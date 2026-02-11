@@ -1,0 +1,15 @@
+{
+  "sound_enabled": true,
+  "notifications": {
+    "start_stop": {
+      "enabled": true,
+      "volume": 100,
+      "file": "K:/Projekt Klikacz NTQ/src/on_off.mp3"
+    },
+    "slot_success": {
+      "enabled": true,
+      "volume": 100,
+      "file": "K:/Projekt Klikacz NTQ/src/succesful.mp3"
+    }
+  }
+}
