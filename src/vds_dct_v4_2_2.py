@@ -20,8 +20,11 @@ import hashlib
 import getpass
 import json
 import datetime as dt
+import platform
+import subprocess
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -29,6 +32,7 @@ from playwright.sync_api import sync_playwright
 
 VERSION = "v4.2.2"
 BUILD_TIME = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
 
 CHANGELOG = [
     "FIX: pętla potwierdzeń TAK/OK po kliknięciu slotu – klika do skutku dopóki przyciski są aktywne.",
@@ -389,6 +393,7 @@ class Worker(threading.Thread):
 
                             # sukces tylko po komunikacie o wysłaniu do kierowcy
                             if success_confirmed(page, success_to):
+                                ui.emit_notification("slot_success")
                                 ui.log("[SUCCESS] Awizacja utworzona (wysłane do kierowcy).")
                                 return
 
@@ -460,10 +465,12 @@ class App(tk.Tk):
 
         self.tab_main = ttk.Frame(nb)
         self.tab_params = ttk.Frame(nb)
+        self.tab_notifications = ttk.Frame(nb)
         self.tab_info = ttk.Frame(nb)
 
         nb.add(self.tab_main, text="Rezerwacja")
         nb.add(self.tab_params, text="Parametry")
+        nb.add(self.tab_notifications, text="Powiadomienia")
         nb.add(self.tab_info, text="Info")
 
         self.machine_id = generate_machine_id()
@@ -475,6 +482,8 @@ class App(tk.Tk):
 
         self.build_main()
         self.build_params()
+        self.build_notifications()
+        self.load_settings()
         self.build_info()
 
         self.worker = None
@@ -556,6 +565,259 @@ class App(tk.Tk):
             text="Uwaga: wartości są pobierane w momencie kliknięcia START.",
             foreground="#444"
         ).pack(anchor="w", padx=10, pady=8)
+
+    def build_notifications(self):
+        f = self.tab_notifications
+
+        ttk.Label(
+            f,
+            text="Ustawienia powiadomień",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", padx=10, pady=(10, 8))
+
+        self.notification_settings = {
+            "start_stop": {
+                "label": "Start/Stop programu",
+                "enabled": True,
+                "volume": tk.IntVar(value=80),
+                "file": tk.StringVar(value="brak"),
+                "button": None,
+            },
+            "slot_success": {
+                "label": "Udane kliknięcie okienka",
+                "enabled": True,
+                "volume": tk.IntVar(value=80),
+                "file": tk.StringVar(value="brak"),
+                "button": None,
+            },
+        }
+
+        self._build_notification_row(f, "start_stop")
+        self._build_notification_row(f, "slot_success")
+
+    def _build_notification_row(self, parent, key):
+        cfg = self.notification_settings[key]
+
+        box = ttk.LabelFrame(parent, text=cfg["label"])
+        box.pack(fill="x", padx=10, pady=8)
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(row, text="Status:").pack(side="left")
+
+        btn = tk.Button(
+            row,
+            text="",
+            width=7,
+            command=lambda k=key: self.toggle_notification(k),
+            relief="raised",
+            bd=1,
+        )
+        btn.pack(side="left", padx=(6, 12))
+        cfg["button"] = btn
+
+        ttk.Label(row, text="Głośność:").pack(side="left")
+        tk.Scale(
+            row,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            showvalue=True,
+            length=170,
+            variable=cfg["volume"],
+            command=lambda _v, k=key: self.on_notification_volume_change(k),
+        ).pack(side="left", padx=(6, 12))
+
+        ttk.Label(row, text="Plik:").pack(side="left")
+        ttk.Label(row, textvariable=cfg["file"], width=18).pack(side="left", padx=(6, 6))
+        ttk.Button(
+            row,
+            text="Wybierz",
+            command=lambda k=key: self.select_notification_file(k),
+        ).pack(side="left")
+        ttk.Button(
+            row,
+            text="Test",
+            command=lambda k=key: self.test_notification_sound(k),
+        ).pack(side="left", padx=(8, 0))
+
+        self.update_notification_button_style(key)
+
+    def update_notification_button_style(self, key):
+        cfg = self.notification_settings[key]
+        btn = cfg["button"]
+        if not btn:
+            return
+
+        if cfg["enabled"]:
+            btn.config(
+                text="ON",
+                bg="#22C55E",
+                activebackground="#16A34A",
+                fg="white",
+                activeforeground="white",
+                disabledforeground="white",
+            )
+        else:
+            btn.config(
+                text="OFF",
+                bg="#DC2626",
+                activebackground="#B91C1C",
+                fg="white",
+                activeforeground="white",
+                disabledforeground="white",
+            )
+
+    def toggle_notification(self, key):
+        cfg = self.notification_settings[key]
+        cfg["enabled"] = not cfg["enabled"]
+        self.update_notification_button_style(key)
+        self.save_settings()
+
+    def select_notification_file(self, key):
+        path = filedialog.askopenfilename(title="Wybierz plik dźwięku")
+        if path:
+            self.notification_settings[key]["file"].set(path)
+            self.save_settings()
+
+    def on_notification_volume_change(self, key):
+        _ = key
+        self.save_settings()
+
+    def test_notification_sound(self, key):
+        cfg = self.notification_settings.get(key)
+        if not cfg:
+            return
+
+        if not self.sound_enabled:
+            self.log(f"[TEST] {cfg['label']} - globalny DZWIEK jest OFF")
+            return
+
+        if not cfg["enabled"]:
+            self.log(f"[TEST] {cfg['label']} - to powiadomienie jest OFF")
+            return
+
+        sound_file = cfg["file"].get().strip()
+        if not sound_file or sound_file == "brak":
+            self.log(f"[TEST] {cfg['label']} - brak wybranego pliku")
+            return
+
+        self.play_sound_file_once(sound_file, cfg["label"], int(cfg["volume"].get()))
+
+    def play_sound_file_once(self, sound_file: str, label: str, volume_percent: int = 100):
+        try:
+            p = Path(sound_file)
+            if not p.exists():
+                self.log(f"[TEST] {label} - plik nie istnieje: {sound_file}")
+                return
+
+            if platform.system() != "Windows":
+                self.log(f"[TEST] {label} - odtwarzanie działa tylko na Windows")
+                return
+
+            # Odtwarzanie plików (mp3/wav/inne wspierane przez MediaPlayer)
+            # z uwzględnieniem głośności z UI.
+            escaped_path = str(p).replace("'", "''")
+            volume = max(0.0, min(1.0, float(volume_percent) / 100.0))
+            ps_cmd = (
+                "Add-Type -AssemblyName PresentationCore; "
+                "$player = New-Object System.Windows.Media.MediaPlayer; "
+                f"$player.Open([Uri]'{escaped_path}'); "
+                f"$player.Volume = {volume}; "
+                "$player.Play(); "
+                "while (-not $player.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 50 }; "
+                "Start-Sleep -Milliseconds ([Math]::Ceiling($player.NaturalDuration.TimeSpan.TotalMilliseconds)); "
+                "$player.Stop(); $player.Close();"
+            )
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            if res.returncode != 0:
+                self.log(f"[TEST] {label} - nie udało się odtworzyć pliku")
+                return
+
+            self.log(f"[TEST] {label} - odtworzono 1 raz")
+
+        except Exception as e:
+            self.log(f"[TEST] {label} - błąd odtwarzania: {e}")
+
+    def is_notification_sound_enabled(self, key):
+        cfg = self.notification_settings.get(key)
+        if not cfg:
+            return False
+        return self.sound_enabled and bool(cfg["enabled"])
+
+    def emit_notification(self, key):
+        cfg = self.notification_settings.get(key)
+        if not cfg:
+            return
+
+        if self.is_notification_sound_enabled(key):
+            sound_file = str(cfg["file"].get()).strip()
+            volume = int(cfg["volume"].get())
+
+            self.log(
+                f"[NOTIFY] {cfg['label']} ON | glosnosc={int(cfg['volume'].get())} | plik={cfg['file'].get()}"
+            )
+
+            if sound_file and sound_file != "brak":
+                threading.Thread(
+                    target=self.play_sound_file_once,
+                    args=(sound_file, cfg["label"], volume),
+                    daemon=True,
+                ).start()
+            else:
+                self.log(f"[NOTIFY] {cfg['label']} - brak wybranego pliku")
+        else:
+            self.log(f"[NOTIFY] {cfg['label']} wyciszone")
+
+    def save_settings(self):
+        try:
+            payload = {
+                "sound_enabled": self.sound_enabled,
+                "notifications": {},
+            }
+            for key, cfg in self.notification_settings.items():
+                payload["notifications"][key] = {
+                    "enabled": bool(cfg["enabled"]),
+                    "volume": int(cfg["volume"].get()),
+                    "file": str(cfg["file"].get()),
+                }
+
+            SETTINGS_FILE.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            self.log(f"[SETTINGS] Nie udało się zapisać ustawień: {e}")
+
+    def load_settings(self):
+        if not SETTINGS_FILE.exists():
+            self.save_settings()
+            return
+
+        try:
+            raw = SETTINGS_FILE.read_text(encoding="utf-8")
+            data = json.loads(raw)
+
+            self.sound_enabled = bool(data.get("sound_enabled", self.sound_enabled))
+            self.update_sound_button_style()
+
+            incoming = data.get("notifications", {})
+            for key, cfg in self.notification_settings.items():
+                src = incoming.get(key, {}) if isinstance(incoming, dict) else {}
+                cfg["enabled"] = bool(src.get("enabled", cfg["enabled"]))
+                cfg["volume"].set(int(src.get("volume", cfg["volume"].get())))
+                cfg["file"].set(str(src.get("file", cfg["file"].get())))
+                self.update_notification_button_style(key)
+
+        except Exception as e:
+            self.log(f"[SETTINGS] Nie udało się wczytać ustawień, używam domyślnych: {e}")
+            self.save_settings()
 
     def build_info(self):
         f = self.tab_info
@@ -678,6 +940,7 @@ class App(tk.Tk):
         self.update_sound_button_style()
         state = "ON" if self.sound_enabled else "OFF"
         self.log(f"[UI] DZWIEK: {state}")
+        self.save_settings()
 
     # ---------- license ----------
 
@@ -720,6 +983,8 @@ class App(tk.Tk):
     # ---------- controls ----------
 
     def start(self):
+        self.emit_notification("start_stop")
+
         # START ma sprawdzić licencję i zamknąć program jeśli nieważna
         self.refresh_license_status(close_on_invalid=True)
         if not self.winfo_exists():
@@ -731,8 +996,11 @@ class App(tk.Tk):
         self.log("[UI] START")
         self.worker = Worker(self)
         self.worker.start()
+        self.emit_notification("start_stop")
 
     def stop(self):
+        self.emit_notification("start_stop")
+
         # STOP ma też sprawdzić licencję i zamknąć program jeśli nieważna
         self.refresh_license_status(close_on_invalid=True)
         if not self.winfo_exists():
@@ -741,6 +1009,7 @@ class App(tk.Tk):
         if self.worker:
             self.worker.stop()
             self.log("[UI] STOP")
+            self.emit_notification("start_stop")
 
 
 if __name__ == "__main__":
