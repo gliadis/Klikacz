@@ -703,9 +703,9 @@ class App(tk.Tk):
             self.log(f"[TEST] {cfg['label']} - brak wybranego pliku")
             return
 
-        self.play_sound_file_once(sound_file, cfg["label"])
+        self.play_sound_file_once(sound_file, cfg["label"], int(cfg["volume"].get()))
 
-    def play_sound_file_once(self, sound_file: str, label: str):
+    def play_sound_file_once(self, sound_file: str, label: str, volume_percent: int = 100):
         try:
             p = Path(sound_file)
             if not p.exists():
@@ -716,23 +716,15 @@ class App(tk.Tk):
                 self.log(f"[TEST] {label} - odtwarzanie działa tylko na Windows")
                 return
 
-            ext = p.suffix.lower()
-
-            # WAV: natywne, pewne odtworzenie synchroniczne.
-            if ext == ".wav":
-                import winsound  # type: ignore
-
-                winsound.PlaySound(str(p), winsound.SND_FILENAME)
-                self.log(f"[TEST] {label} - odtworzono 1 raz")
-                return
-
-            # MP3/inne: PowerShell + MediaPlayer (obsługa formatów multimedialnych).
+            # Odtwarzanie plików (mp3/wav/inne wspierane przez MediaPlayer)
+            # z uwzględnieniem głośności z UI.
             escaped_path = str(p).replace("'", "''")
+            volume = max(0.0, min(1.0, float(volume_percent) / 100.0))
             ps_cmd = (
                 "Add-Type -AssemblyName PresentationCore; "
                 "$player = New-Object System.Windows.Media.MediaPlayer; "
                 f"$player.Open([Uri]'{escaped_path}'); "
-                "$player.Volume = 1.0; "
+                f"$player.Volume = {volume}; "
                 "$player.Play(); "
                 "while (-not $player.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 50 }; "
                 "Start-Sleep -Milliseconds ([Math]::Ceiling($player.NaturalDuration.TimeSpan.TotalMilliseconds)); "
@@ -765,9 +757,21 @@ class App(tk.Tk):
             return
 
         if self.is_notification_sound_enabled(key):
+            sound_file = str(cfg["file"].get()).strip()
+            volume = int(cfg["volume"].get())
+
             self.log(
                 f"[NOTIFY] {cfg['label']} ON | glosnosc={int(cfg['volume'].get())} | plik={cfg['file'].get()}"
             )
+
+            if sound_file and sound_file != "brak":
+                threading.Thread(
+                    target=self.play_sound_file_once,
+                    args=(sound_file, cfg["label"], volume),
+                    daemon=True,
+                ).start()
+            else:
+                self.log(f"[NOTIFY] {cfg['label']} - brak wybranego pliku")
         else:
             self.log(f"[NOTIFY] {cfg['label']} wyciszone")
 
