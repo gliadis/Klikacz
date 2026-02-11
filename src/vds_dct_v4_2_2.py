@@ -487,6 +487,9 @@ class App(tk.Tk):
     def build_main(self):
         f = self.tab_main
 
+        # Prosty stan ON/OFF (bez efektu dźwiękowego na tym etapie).
+        self.sound_enabled = True
+
         # domyślny zakres: następna pełna godzina -> +1h
         now = dt.datetime.now()
         start_dt = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
@@ -515,6 +518,16 @@ class App(tk.Tk):
 
         ttk.Button(b, text="START", command=self.start).pack(side="left", padx=5)
         ttk.Button(b, text="STOP", command=self.stop).pack(side="left", padx=5)
+        self.sound_btn = tk.Button(
+            b,
+            text="DZWIEK",
+            width=10,
+            command=self.toggle_sound,
+            relief="raised",
+            bd=1,
+        )
+        self.sound_btn.pack(side="left", padx=5)
+        self.update_sound_button_style()
 
         self.log_box = tk.Text(f, height=16)
         self.log_box.pack(fill="both", expand=True, padx=10, pady=5)
@@ -641,6 +654,30 @@ class App(tk.Tk):
         except Exception:
             success_to = 4000
         return poll, load_to, success_to
+
+    def update_sound_button_style(self):
+        if self.sound_enabled:
+            self.sound_btn.config(
+                bg="#22C55E",
+                activebackground="#16A34A",
+                fg="white",
+                activeforeground="white",
+                disabledforeground="white",
+            )
+        else:
+            self.sound_btn.config(
+                bg="#DC2626",
+                activebackground="#B91C1C",
+                fg="white",
+                activeforeground="white",
+                disabledforeground="white",
+            )
+
+    def toggle_sound(self):
+        self.sound_enabled = not self.sound_enabled
+        self.update_sound_button_style()
+        state = "ON" if self.sound_enabled else "OFF"
+        self.log(f"[UI] DZWIEK: {state}")
 
     # ---------- license ----------
 
