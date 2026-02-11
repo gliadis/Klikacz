@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+.venv/
+
+# PyInstaller / build artifacts
+build/
+dist/
+*.spec
+
+# Windows junk
+Thumbs.db
+.DS_Store
+
+# optional: releases with exe (zdecydujemy niżej)
+releases/
