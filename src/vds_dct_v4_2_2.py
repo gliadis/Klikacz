@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-VBS klikacz NTQ – v4.2.2 (STABLE)
+VBS klikacz NTQ – v4.2.3 (STABLE)
 
-Zmiany v4.2.2:
-• FIX: agresywne „dobijanie” dialogów po kliknięciu slotu (TAK/OK) – pętla klika do skutku, dopóki przyciski są aktywne.
-• Zachowane: poprawione klikanie slotów z tekstem typu "02:00-02:59 44/130".
-• Info: wersja/build/zmiany/status licencji, ID komputera + Kopiuj.
-• Refresh 1-dniowy: klik STANDARDOWE.
+Zmiany v4.2.3:
+• Powiadomienia: konfiguracja typów, ON/OFF, głośność, wybór pliku i test dźwięku.
+• Powiadomienia: zapis/wczytywanie ustawień lokalnych (settings.json).
+• Audio: poprawione odtwarzanie MP3/WAV oraz wywołania dźwięku dla zdarzeń START/STOP.
+• Zachowane: stabilna logika rezerwacji slotów i potwierdzeń TAK/OK.
 
 Zasady licencji:
 - Status OK -> program działa
@@ -30,7 +30,7 @@ from urllib.request import Request, urlopen
 
 from playwright.sync_api import sync_playwright
 
-VERSION = "v4.2.2"
+VERSION = "v4.2.3"
 BUILD_TIME = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
 
@@ -201,7 +201,7 @@ def success_confirmed(page, timeout_ms):
 
 def confirm_loop_fast(page, max_clicks=25):
     """
-    v4.2.2: Klikaj TAK/OK najszybciej jak się da, dopóki:
+    v4.2.3: Klikaj TAK/OK najszybciej jak się da, dopóki:
       - widzimy przyciski TAK/OK
       - lub do osiągnięcia limitu kliknięć
     Priorytet: TAK, potem OK/Ok.
@@ -401,7 +401,7 @@ class Worker(threading.Thread):
 
     def try_slot(self, page, slot_key, load_to, success_to):
         """
-        Kliknięcie slotu + agresywna pętla potwierdzeń TAK/OK (v4.2.2).
+        Kliknięcie slotu + agresywna pętla potwierdzeń TAK/OK (v4.2.3).
         """
         try:
             # Preferujemy button/a/role=button zawierające slot_key
@@ -437,7 +437,7 @@ class Worker(threading.Thread):
 
             wait_for_slots_loaded(page, load_to)
 
-            # v4.2.2: agresywne dobijanie dialogów TAK/OK
+            # v4.2.3: agresywne dobijanie dialogów TAK/OK
             # klikamy do skutku dopóki są aktywne przyciski lub do limitu
             confirm_loop_fast(page, max_clicks=30)
 
