@@ -20,8 +20,11 @@ import hashlib
 import getpass
 import json
 import datetime as dt
+import platform
+import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -29,6 +32,7 @@ from playwright.sync_api import sync_playwright
 
 VERSION = "v4.2.2"
 BUILD_TIME = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
 
 CHANGELOG = [
     "FIX: pętla potwierdzeń TAK/OK po kliknięciu slotu – klika do skutku dopóki przyciski są aktywne.",
@@ -479,6 +483,7 @@ class App(tk.Tk):
         self.build_main()
         self.build_params()
         self.build_notifications()
+        self.load_settings()
         self.build_info()
 
         self.worker = None
@@ -621,6 +626,7 @@ class App(tk.Tk):
             showvalue=True,
             length=170,
             variable=cfg["volume"],
+            command=lambda _v, k=key: self.on_notification_volume_change(k),
         ).pack(side="left", padx=(6, 12))
 
         ttk.Label(row, text="Plik:").pack(side="left")
@@ -630,6 +636,11 @@ class App(tk.Tk):
             text="Wybierz",
             command=lambda k=key: self.select_notification_file(k),
         ).pack(side="left")
+        ttk.Button(
+            row,
+            text="Test",
+            command=lambda k=key: self.test_notification_sound(k),
+        ).pack(side="left", padx=(8, 0))
 
         self.update_notification_button_style(key)
 
@@ -662,11 +673,65 @@ class App(tk.Tk):
         cfg = self.notification_settings[key]
         cfg["enabled"] = not cfg["enabled"]
         self.update_notification_button_style(key)
+        self.save_settings()
 
     def select_notification_file(self, key):
         path = filedialog.askopenfilename(title="Wybierz plik dźwięku")
         if path:
             self.notification_settings[key]["file"].set(path)
+            self.save_settings()
+
+    def on_notification_volume_change(self, key):
+        _ = key
+        self.save_settings()
+
+    def test_notification_sound(self, key):
+        cfg = self.notification_settings.get(key)
+        if not cfg:
+            return
+
+        if not self.sound_enabled:
+            self.log(f"[TEST] {cfg['label']} - globalny DZWIEK jest OFF")
+            return
+
+        if not cfg["enabled"]:
+            self.log(f"[TEST] {cfg['label']} - to powiadomienie jest OFF")
+            return
+
+        sound_file = cfg["file"].get().strip()
+        if not sound_file or sound_file == "brak":
+            self.log(f"[TEST] {cfg['label']} - brak wybranego pliku")
+            return
+
+        self.play_sound_file_once(sound_file, cfg["label"])
+
+    def play_sound_file_once(self, sound_file: str, label: str):
+        try:
+            p = Path(sound_file)
+            if not p.exists():
+                self.log(f"[TEST] {label} - plik nie istnieje: {sound_file}")
+                return
+
+            if platform.system() != "Windows":
+                self.log(f"[TEST] {label} - odtwarzanie działa tylko na Windows")
+                return
+
+            escaped_path = str(p).replace("'", "''")
+            ps_cmd = (
+                "Add-Type -AssemblyName System.Media; "
+                f"$p = New-Object System.Media.SoundPlayer('{escaped_path}'); "
+                "$p.PlaySync();"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.log(f"[TEST] {label} - odtworzono 1 raz")
+
+        except Exception as e:
+            self.log(f"[TEST] {label} - błąd odtwarzania: {e}")
 
     def is_notification_sound_enabled(self, key):
         cfg = self.notification_settings.get(key)
@@ -685,6 +750,50 @@ class App(tk.Tk):
             )
         else:
             self.log(f"[NOTIFY] {cfg['label']} wyciszone")
+
+    def save_settings(self):
+        try:
+            payload = {
+                "sound_enabled": self.sound_enabled,
+                "notifications": {},
+            }
+            for key, cfg in self.notification_settings.items():
+                payload["notifications"][key] = {
+                    "enabled": bool(cfg["enabled"]),
+                    "volume": int(cfg["volume"].get()),
+                    "file": str(cfg["file"].get()),
+                }
+
+            SETTINGS_FILE.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            self.log(f"[SETTINGS] Nie udało się zapisać ustawień: {e}")
+
+    def load_settings(self):
+        if not SETTINGS_FILE.exists():
+            self.save_settings()
+            return
+
+        try:
+            raw = SETTINGS_FILE.read_text(encoding="utf-8")
+            data = json.loads(raw)
+
+            self.sound_enabled = bool(data.get("sound_enabled", self.sound_enabled))
+            self.update_sound_button_style()
+
+            incoming = data.get("notifications", {})
+            for key, cfg in self.notification_settings.items():
+                src = incoming.get(key, {}) if isinstance(incoming, dict) else {}
+                cfg["enabled"] = bool(src.get("enabled", cfg["enabled"]))
+                cfg["volume"].set(int(src.get("volume", cfg["volume"].get())))
+                cfg["file"].set(str(src.get("file", cfg["file"].get())))
+                self.update_notification_button_style(key)
+
+        except Exception as e:
+            self.log(f"[SETTINGS] Nie udało się wczytać ustawień, używam domyślnych: {e}")
+            self.save_settings()
 
     def build_info(self):
         f = self.tab_info
@@ -807,6 +916,7 @@ class App(tk.Tk):
         self.update_sound_button_style()
         state = "ON" if self.sound_enabled else "OFF"
         self.log(f"[UI] DZWIEK: {state}")
+        self.save_settings()
 
     # ---------- license ----------
 
