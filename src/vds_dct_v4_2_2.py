@@ -21,7 +21,7 @@ import getpass
 import json
 import datetime as dt
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -389,6 +389,7 @@ class Worker(threading.Thread):
 
                             # sukces tylko po komunikacie o wysłaniu do kierowcy
                             if success_confirmed(page, success_to):
+                                ui.emit_notification("slot_success")
                                 ui.log("[SUCCESS] Awizacja utworzona (wysłane do kierowcy).")
                                 return
 
@@ -460,10 +461,12 @@ class App(tk.Tk):
 
         self.tab_main = ttk.Frame(nb)
         self.tab_params = ttk.Frame(nb)
+        self.tab_notifications = ttk.Frame(nb)
         self.tab_info = ttk.Frame(nb)
 
         nb.add(self.tab_main, text="Rezerwacja")
         nb.add(self.tab_params, text="Parametry")
+        nb.add(self.tab_notifications, text="Powiadomienia")
         nb.add(self.tab_info, text="Info")
 
         self.machine_id = generate_machine_id()
@@ -475,6 +478,7 @@ class App(tk.Tk):
 
         self.build_main()
         self.build_params()
+        self.build_notifications()
         self.build_info()
 
         self.worker = None
@@ -486,6 +490,9 @@ class App(tk.Tk):
 
     def build_main(self):
         f = self.tab_main
+
+        # Prosty stan ON/OFF (bez efektu dźwiękowego na tym etapie).
+        self.sound_enabled = True
 
         # domyślny zakres: następna pełna godzina -> +1h
         now = dt.datetime.now()
@@ -515,6 +522,16 @@ class App(tk.Tk):
 
         ttk.Button(b, text="START", command=self.start).pack(side="left", padx=5)
         ttk.Button(b, text="STOP", command=self.stop).pack(side="left", padx=5)
+        self.sound_btn = tk.Button(
+            b,
+            text="DZWIEK",
+            width=10,
+            command=self.toggle_sound,
+            relief="raised",
+            bd=1,
+        )
+        self.sound_btn.pack(side="left", padx=5)
+        self.update_sound_button_style()
 
         self.log_box = tk.Text(f, height=16)
         self.log_box.pack(fill="both", expand=True, padx=10, pady=5)
@@ -543,6 +560,131 @@ class App(tk.Tk):
             text="Uwaga: wartości są pobierane w momencie kliknięcia START.",
             foreground="#444"
         ).pack(anchor="w", padx=10, pady=8)
+
+    def build_notifications(self):
+        f = self.tab_notifications
+
+        ttk.Label(
+            f,
+            text="Ustawienia powiadomień",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", padx=10, pady=(10, 8))
+
+        self.notification_settings = {
+            "start_stop": {
+                "label": "Start/Stop programu",
+                "enabled": True,
+                "volume": tk.IntVar(value=80),
+                "file": tk.StringVar(value="brak"),
+                "button": None,
+            },
+            "slot_success": {
+                "label": "Udane kliknięcie okienka",
+                "enabled": True,
+                "volume": tk.IntVar(value=80),
+                "file": tk.StringVar(value="brak"),
+                "button": None,
+            },
+        }
+
+        self._build_notification_row(f, "start_stop")
+        self._build_notification_row(f, "slot_success")
+
+    def _build_notification_row(self, parent, key):
+        cfg = self.notification_settings[key]
+
+        box = ttk.LabelFrame(parent, text=cfg["label"])
+        box.pack(fill="x", padx=10, pady=8)
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(row, text="Status:").pack(side="left")
+
+        btn = tk.Button(
+            row,
+            text="",
+            width=7,
+            command=lambda k=key: self.toggle_notification(k),
+            relief="raised",
+            bd=1,
+        )
+        btn.pack(side="left", padx=(6, 12))
+        cfg["button"] = btn
+
+        ttk.Label(row, text="Głośność:").pack(side="left")
+        tk.Scale(
+            row,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            showvalue=True,
+            length=170,
+            variable=cfg["volume"],
+        ).pack(side="left", padx=(6, 12))
+
+        ttk.Label(row, text="Plik:").pack(side="left")
+        ttk.Label(row, textvariable=cfg["file"], width=18).pack(side="left", padx=(6, 6))
+        ttk.Button(
+            row,
+            text="Wybierz",
+            command=lambda k=key: self.select_notification_file(k),
+        ).pack(side="left")
+
+        self.update_notification_button_style(key)
+
+    def update_notification_button_style(self, key):
+        cfg = self.notification_settings[key]
+        btn = cfg["button"]
+        if not btn:
+            return
+
+        if cfg["enabled"]:
+            btn.config(
+                text="ON",
+                bg="#22C55E",
+                activebackground="#16A34A",
+                fg="white",
+                activeforeground="white",
+                disabledforeground="white",
+            )
+        else:
+            btn.config(
+                text="OFF",
+                bg="#DC2626",
+                activebackground="#B91C1C",
+                fg="white",
+                activeforeground="white",
+                disabledforeground="white",
+            )
+
+    def toggle_notification(self, key):
+        cfg = self.notification_settings[key]
+        cfg["enabled"] = not cfg["enabled"]
+        self.update_notification_button_style(key)
+
+    def select_notification_file(self, key):
+        path = filedialog.askopenfilename(title="Wybierz plik dźwięku")
+        if path:
+            self.notification_settings[key]["file"].set(path)
+
+    def is_notification_sound_enabled(self, key):
+        cfg = self.notification_settings.get(key)
+        if not cfg:
+            return False
+        return self.sound_enabled and bool(cfg["enabled"])
+
+    def emit_notification(self, key):
+        cfg = self.notification_settings.get(key)
+        if not cfg:
+            return
+
+        if self.is_notification_sound_enabled(key):
+            self.log(
+                f"[NOTIFY] {cfg['label']} ON | glosnosc={int(cfg['volume'].get())} | plik={cfg['file'].get()}"
+            )
+        else:
+            self.log(f"[NOTIFY] {cfg['label']} wyciszone")
 
     def build_info(self):
         f = self.tab_info
@@ -642,6 +784,30 @@ class App(tk.Tk):
             success_to = 4000
         return poll, load_to, success_to
 
+    def update_sound_button_style(self):
+        if self.sound_enabled:
+            self.sound_btn.config(
+                bg="#22C55E",
+                activebackground="#16A34A",
+                fg="white",
+                activeforeground="white",
+                disabledforeground="white",
+            )
+        else:
+            self.sound_btn.config(
+                bg="#DC2626",
+                activebackground="#B91C1C",
+                fg="white",
+                activeforeground="white",
+                disabledforeground="white",
+            )
+
+    def toggle_sound(self):
+        self.sound_enabled = not self.sound_enabled
+        self.update_sound_button_style()
+        state = "ON" if self.sound_enabled else "OFF"
+        self.log(f"[UI] DZWIEK: {state}")
+
     # ---------- license ----------
 
     def refresh_license_status(self, close_on_invalid: bool):
@@ -683,6 +849,8 @@ class App(tk.Tk):
     # ---------- controls ----------
 
     def start(self):
+        self.emit_notification("start_stop")
+
         # START ma sprawdzić licencję i zamknąć program jeśli nieważna
         self.refresh_license_status(close_on_invalid=True)
         if not self.winfo_exists():
@@ -694,8 +862,11 @@ class App(tk.Tk):
         self.log("[UI] START")
         self.worker = Worker(self)
         self.worker.start()
+        self.emit_notification("start_stop")
 
     def stop(self):
+        self.emit_notification("start_stop")
+
         # STOP ma też sprawdzić licencję i zamknąć program jeśli nieważna
         self.refresh_license_status(close_on_invalid=True)
         if not self.winfo_exists():
@@ -704,6 +875,7 @@ class App(tk.Tk):
         if self.worker:
             self.worker.stop()
             self.log("[UI] STOP")
+            self.emit_notification("start_stop")
 
 
 if __name__ == "__main__":
