@@ -716,18 +716,38 @@ class App(tk.Tk):
                 self.log(f"[TEST] {label} - odtwarzanie działa tylko na Windows")
                 return
 
+            ext = p.suffix.lower()
+
+            # WAV: natywne, pewne odtworzenie synchroniczne.
+            if ext == ".wav":
+                import winsound  # type: ignore
+
+                winsound.PlaySound(str(p), winsound.SND_FILENAME)
+                self.log(f"[TEST] {label} - odtworzono 1 raz")
+                return
+
+            # MP3/inne: PowerShell + MediaPlayer (obsługa formatów multimedialnych).
             escaped_path = str(p).replace("'", "''")
             ps_cmd = (
-                "Add-Type -AssemblyName System.Media; "
-                f"$p = New-Object System.Media.SoundPlayer('{escaped_path}'); "
-                "$p.PlaySync();"
+                "Add-Type -AssemblyName PresentationCore; "
+                "$player = New-Object System.Windows.Media.MediaPlayer; "
+                f"$player.Open([Uri]'{escaped_path}'); "
+                "$player.Volume = 1.0; "
+                "$player.Play(); "
+                "while (-not $player.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 50 }; "
+                "Start-Sleep -Milliseconds ([Math]::Ceiling($player.NaturalDuration.TimeSpan.TotalMilliseconds)); "
+                "$player.Stop(); $player.Close();"
             )
-            subprocess.run(
+            res = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True,
-                text=True,
-                timeout=15,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
             )
+            if res.returncode != 0:
+                self.log(f"[TEST] {label} - nie udało się odtworzyć pliku")
+                return
+
             self.log(f"[TEST] {label} - odtworzono 1 raz")
 
         except Exception as e:
