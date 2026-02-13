@@ -199,43 +199,58 @@ def success_confirmed(page, timeout_ms):
         return False
 
 
-def confirm_loop_fast(page, max_clicks=25):
+def confirm_loop_fast(page, max_clicks=60):
     """
-    v4.2.3: Klikaj TAK/OK najszybciej jak się da, dopóki:
-      - widzimy przyciski TAK/OK
-      - lub do osiągnięcia limitu kliknięć
-    Priorytet: TAK, potem OK/Ok.
-    Zatrzymaj, jeśli widoczny jest sukces.
+    Szybkie klikanie potwierdzeń TAK/OK po kliknięciu slotu.
+
+    Ważne: nie przerywaj od razu, gdy przycisku jeszcze nie ma.
+    Modal może pojawić się po krótkiej animacji/opóźnieniu renderu.
     """
+    tak_selectors = [
+        "button:has-text('Tak')",
+        "[role='button']:has-text('Tak')",
+        "a:has-text('Tak')",
+        "text=/^\s*Tak\s*$/i",
+    ]
+    ok_selectors = [
+        "button:has-text('OK')",
+        "button:has-text('Ok')",
+        "[role='button']:has-text('OK')",
+        "[role='button']:has-text('Ok')",
+        "a:has-text('OK')",
+        "a:has-text('Ok')",
+        "text=/^\s*OK\s*$/i",
+        "text=/^\s*Ok\s*$/i",
+    ]
+
     for _ in range(max_clicks):
         if success_visible(page):
             return
 
         clicked = False
 
-        # Priorytet: TAK (bez wcześniejszego count/is_visible/is_enabled,
-        # żeby minimalizować koszt odpytywania DOM i kliknąć jak najszybciej)
-        try:
-            page.get_by_role("button", name="Tak").first.click(timeout=160)
-            clicked = True
-        except Exception:
-            pass
+        # Priorytet: TAK
+        for sel in tak_selectors:
+            try:
+                page.locator(sel).first.click(timeout=220)
+                clicked = True
+                break
+            except Exception:
+                pass
 
+        # Następnie OK / Ok
         if not clicked:
-            # OK / Ok
-            for txt in ("OK", "Ok"):
+            for sel in ok_selectors:
                 try:
-                    page.get_by_role("button", name=txt).first.click(timeout=160)
+                    page.locator(sel).first.click(timeout=220)
                     clicked = True
                     break
                 except Exception:
                     pass
 
-        if not clicked:
-            return
-
-        # minimalna pauza na repaint DOM
-        time.sleep(0.005)
+        # Jeśli nic nie kliknięto, NIE kończymy od razu.
+        # Dajemy czas na pojawienie się modala i próbujemy dalej.
+        time.sleep(0.01 if not clicked else 0.005)
 
 
 def get_selected_day_number(page):
@@ -434,11 +449,11 @@ class Worker(threading.Thread):
 
             # Faza 1 (ultra-fast): od razu próbujemy klikać dialogi,
             # bez czekania na pełne dociągnięcie UI.
-            confirm_loop_fast(page, max_clicks=20)
+            confirm_loop_fast(page, max_clicks=60)
 
             # Faza 2: jeśli UI jeszcze ładuje, dokończ po załadowaniu.
             wait_for_slots_loaded(page, load_to)
-            confirm_loop_fast(page, max_clicks=20)
+            confirm_loop_fast(page, max_clicks=40)
 
             # jeśli sukces pojawi się szybko, kończymy od razu
             if success_visible(page):
