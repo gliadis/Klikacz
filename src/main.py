@@ -213,12 +213,11 @@ def confirm_loop_fast(page, max_clicks=25):
 
         clicked = False
 
-        # Priorytet: TAK
+        # Priorytet: TAK (bez wcześniejszego count/is_visible/is_enabled,
+        # żeby minimalizować koszt odpytywania DOM i kliknąć jak najszybciej)
         try:
-            b = page.locator("button:has-text('Tak')").first
-            if b.count() and b.is_visible() and b.is_enabled():
-                b.click(timeout=600)
-                clicked = True
+            page.get_by_role("button", name="Tak").first.click(timeout=160)
+            clicked = True
         except Exception:
             pass
 
@@ -226,19 +225,17 @@ def confirm_loop_fast(page, max_clicks=25):
             # OK / Ok
             for txt in ("OK", "Ok"):
                 try:
-                    b2 = page.locator(f"button:has-text('{txt}')").first
-                    if b2.count() and b2.is_visible() and b2.is_enabled():
-                        b2.click(timeout=600)
-                        clicked = True
-                        break
+                    page.get_by_role("button", name=txt).first.click(timeout=160)
+                    clicked = True
+                    break
                 except Exception:
                     pass
 
         if not clicked:
             return
 
-        # minimalna pauza na repaint DOM (bardzo krótka)
-        time.sleep(0.02)
+        # minimalna pauza na repaint DOM
+        time.sleep(0.005)
 
 
 def get_selected_day_number(page):
@@ -435,11 +432,13 @@ class Worker(threading.Thread):
                 self.ui.log(f"[WARN] Kafelek slotu jest, ale nie udało się kliknąć: {slot_key}")
                 return
 
-            wait_for_slots_loaded(page, load_to)
+            # Faza 1 (ultra-fast): od razu próbujemy klikać dialogi,
+            # bez czekania na pełne dociągnięcie UI.
+            confirm_loop_fast(page, max_clicks=20)
 
-            # v4.2.3: agresywne dobijanie dialogów TAK/OK
-            # klikamy do skutku dopóki są aktywne przyciski lub do limitu
-            confirm_loop_fast(page, max_clicks=30)
+            # Faza 2: jeśli UI jeszcze ładuje, dokończ po załadowaniu.
+            wait_for_slots_loaded(page, load_to)
+            confirm_loop_fast(page, max_clicks=20)
 
             # jeśli sukces pojawi się szybko, kończymy od razu
             if success_visible(page):
