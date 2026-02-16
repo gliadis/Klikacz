@@ -127,17 +127,32 @@ def wait_for_slots_loaded(page, timeout_ms):
 
 def ensure_slot_screen(page):
     """Sprawdza, czy jesteśmy na ekranie wyboru slotów."""
-    try:
-        has_std = page.locator("text=STANDARDOWE").count() > 0
-        has_slot = page.locator(r"text=/\b\d{2}:\d{2}-\d{2}:\d{2}\b/").count() > 0
-        if has_std and has_slot:
-            return
-    except Exception:
-        pass
+    if is_slot_screen(page):
+        return
     raise RuntimeError(
         "Nie jestem na ekranie wyboru okienek (slotów). "
         "Otwórz awizację w widoku slotów (kalendarz + siatka slotów) i dopiero kliknij START."
     )
+
+
+def is_slot_screen(page):
+    """Czy aktualnie widoczny jest ekran wyboru slotów."""
+    try:
+        has_std = page.locator("text=STANDARDOWE").count() > 0
+        has_slot = page.locator(r"text=/\b\d{2}:\d{2}-\d{2}:\d{2}\b/").count() > 0
+        return bool(has_std and has_slot)
+    except Exception:
+        return False
+
+
+def wait_until_slot_screen(page, stop_evt, timeout_s=180):
+    """Czekaj aż użytkownik ponownie otworzy okno z kalendarzem i slotami."""
+    deadline = time.time() + float(timeout_s)
+    while not stop_evt.is_set() and time.time() < deadline:
+        if is_slot_screen(page):
+            return True
+        time.sleep(0.20)
+    return is_slot_screen(page)
 
 
 def fast_read_slots(page):
@@ -178,6 +193,52 @@ def toast_no_slots(page):
             return True
     except Exception:
         pass
+    return False
+
+
+def toast_edited_by_other_user(page):
+    """Toast: awizacja edytowana przez innego użytkownika."""
+    try:
+        loc = page.locator("text=/Awizacja edytowana przez innego użytkownika/i").first
+        return loc.count() > 0 and loc.is_visible()
+    except Exception:
+        return False
+
+
+def toast_cloudflare(page):
+    """Toast: Cloudflare error occurred."""
+    try:
+        loc = page.locator("text=/Cloudflare error occurred/i").first
+        return loc.count() > 0 and loc.is_visible()
+    except Exception:
+        return False
+
+
+def loading_slots_visible(page):
+    """Czy UI pokazuje trwające ładowanie slotów."""
+    try:
+        loc = page.locator("text=Ładowanie slotów").first
+        return loc.count() > 0 and loc.is_visible()
+    except Exception:
+        return False
+
+
+def click_anuluj(page):
+    """Best-effort kliknięcie Anuluj na modalu awizacji."""
+    selectors = [
+        "button:has-text('Anuluj')",
+        "[role='button']:has-text('Anuluj')",
+        "a:has-text('Anuluj')",
+        "text=/^\s*Anuluj\s*$/i",
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() and el.is_visible():
+                el.click(timeout=1200)
+                return True
+        except Exception:
+            pass
     return False
 
 
@@ -358,6 +419,7 @@ class Worker(threading.Thread):
             ui.log(f"[OK] Strona: {page.url}")
             ensure_slot_screen(page)
 
+            skip_slot_once = None
             while not self.stop_evt.is_set():
                 for day in days:
                     if self.stop_evt.is_set():
@@ -392,28 +454,64 @@ class Worker(threading.Thread):
                             continue
 
                         used, total = slots[slot_key]
-                        if used < total:
-                            ui.log(f"[TRY] {day.isoformat()} {slot_key} {used}/{total}")
+                        if used >= total:
+                            continue
 
-                            # klik slot + potwierdzenia
-                            self.try_slot(page, slot_key, load_to, success_to)
+                        if skip_slot_once == (day.isoformat(), slot_key):
+                            ui.log(f"[SAFE] Pomijam 1x po recovery: {day.isoformat()} {slot_key}")
+                            skip_slot_once = None
+                            continue
 
-                            # jeśli toast "brak slotów" -> wracamy do odświeżania
-                            if toast_no_slots(page):
-                                ui.log("[INFO] Toast 'Brak dostępnych slotów' – kontynuuję odświeżanie.")
-                                continue
+                        ui.log(f"[TRY] {day.isoformat()} {slot_key} {used}/{total}")
 
-                            # sukces tylko po komunikacie o wysłaniu do kierowcy
-                            if success_confirmed(page, success_to):
+                        # klik slot + potwierdzenia
+                        outcome = self.try_slot(page, slot_key, load_to, success_to)
+
+                        if outcome == "NO_SLOTS":
+                            ui.log("[INFO] Toast 'Brak dostępnych slotów' – kontynuuję odświeżanie.")
+                            continue
+
+                        if outcome == "EDITED_BY_OTHER":
+                            ui.log("[INFO] Awizacja edytowana przez innego użytkownika (1/2) – ponawiam kliknięcie.")
+                            outcome_retry = self.try_slot(page, slot_key, load_to, success_to)
+                            if outcome_retry == "SUCCESS":
                                 ui.emit_notification("slot_success")
                                 ui.log("[SUCCESS] Awizacja utworzona (wysłane do kierowcy).")
                                 return
+                            if outcome_retry == "EDITED_BY_OTHER":
+                                ui.log("[INFO] Awizacja edytowana przez innego użytkownika (2/2) – odświeżam listę okienek.")
+                                if len(days) == 1:
+                                    click_standardowe(page, load_to)
+                                else:
+                                    click_day_by_coordinates(page, day, load_to)
+                            continue
+
+                        if outcome == "CLOUDFLARE":
+                            ui.log("[WARN] Wykryto Cloudflare error. Próba recovery (Anuluj + oczekiwanie na ręczne Edytuj).")
+                            if click_anuluj(page):
+                                ui.log("[INFO] Kliknięto 'Anuluj'. Czekam aż użytkownik ponownie otworzy okna (Edytuj).")
+                            else:
+                                ui.log("[WARN] Nie udało się kliknąć 'Anuluj'. Czekam na powrót ekranu slotów.")
+
+                            if not wait_until_slot_screen(page, self.stop_evt, timeout_s=180):
+                                ui.log("[WARN] Timeout oczekiwania na ponowne otwarcie slotów (Edytuj).")
+                                continue
+
+                            skip_slot_once = (day.isoformat(), slot_key)
+                            ui.log(f"[SAFE] Po recovery pominę 1x slot: {slot_key}")
+                            break
+
+                        if outcome == "SUCCESS":
+                            ui.emit_notification("slot_success")
+                            ui.log("[SUCCESS] Awizacja utworzona (wysłane do kierowcy).")
+                            return
 
                 time.sleep(max(0.05, float(poll_s)))
 
     def try_slot(self, page, slot_key, load_to, success_to):
         """
         Kliknięcie slotu + agresywna pętla potwierdzeń TAK/OK (v4.2.3).
+        Zwraca status: SUCCESS | NO_SLOTS | EDITED_BY_OTHER | CLOUDFLARE | RETRY.
         """
         try:
             # Preferujemy button/a/role=button zawierające slot_key
@@ -429,7 +527,7 @@ class Worker(threading.Thread):
 
             if n == 0:
                 self.ui.log(f"[WARN] Nie znalazłem kafelka dla slotu: {slot_key}")
-                return
+                return "RETRY"
 
             clicked = False
             for i in range(min(n, 12)):
@@ -445,25 +543,57 @@ class Worker(threading.Thread):
 
             if not clicked:
                 self.ui.log(f"[WARN] Kafelek slotu jest, ale nie udało się kliknąć: {slot_key}")
-                return
+                return "RETRY"
 
             # Faza 1 (ultra-fast): od razu próbujemy klikać dialogi,
             # bez czekania na pełne dociągnięcie UI.
             confirm_loop_fast(page, max_clicks=60)
 
+            cloudflare_hits = 0
+            loading_started = None
+            deadline = time.time() + max(2.0, float(load_to) / 1000.0 + 1.0)
+
+            while time.time() < deadline:
+                if success_visible(page) or success_confirmed(page, 120):
+                    return "SUCCESS"
+                if toast_no_slots(page):
+                    return "NO_SLOTS"
+                if toast_edited_by_other_user(page):
+                    return "EDITED_BY_OTHER"
+                if toast_cloudflare(page):
+                    cloudflare_hits += 1
+                    if cloudflare_hits >= 2:
+                        return "CLOUDFLARE"
+                if loading_slots_visible(page):
+                    if loading_started is None:
+                        loading_started = time.time()
+                    elif (time.time() - loading_started) >= 15.0:
+                        return "CLOUDFLARE"
+                else:
+                    loading_started = None
+
+                # domykanie ewentualnych popupów
+                confirm_loop_fast(page, max_clicks=4)
+                time.sleep(0.08)
+
             # Faza 2: jeśli UI jeszcze ładuje, dokończ po załadowaniu.
             wait_for_slots_loaded(page, load_to)
-            confirm_loop_fast(page, max_clicks=40)
+            confirm_loop_fast(page, max_clicks=30)
 
-            # jeśli sukces pojawi się szybko, kończymy od razu
-            if success_visible(page):
-                return
+            if success_visible(page) or success_confirmed(page, min(800, int(success_to))):
+                return "SUCCESS"
+            if toast_no_slots(page):
+                return "NO_SLOTS"
+            if toast_edited_by_other_user(page):
+                return "EDITED_BY_OTHER"
+            if toast_cloudflare(page):
+                return "CLOUDFLARE"
 
-            # dodatkowo: jeszcze krótko poczekaj na sukces (minimalnie)
-            success_confirmed(page, min(800, int(success_to)))
+            return "RETRY"
 
         except Exception as e:
             self.ui.log(f"[WARN] Kliknięcie slotu nie powiodło się: {e}")
+            return "RETRY"
 
 
 # ------------------ UI ------------------
