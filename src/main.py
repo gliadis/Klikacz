@@ -433,7 +433,7 @@ class Worker(threading.Thread):
             ui.log(f"[OK] Strona: {page.url}")
             ensure_slot_screen(page)
 
-            skip_slot_once = None
+            skip_day_once = None
             while not self.stop_evt.is_set():
                 for day in days:
                     if self.stop_evt.is_set():
@@ -458,6 +458,11 @@ class Worker(threading.Thread):
 
                     slots = fast_read_slots(page)
 
+                    if skip_day_once == day.isoformat():
+                        ui.log(f"[SAFE] Pomijam 1x cały dzień po recovery: {day.isoformat()}")
+                        skip_day_once = None
+                        continue
+
                     # 4) Sprawdź sloty tylko dla tego dnia i dla zakresu godzin
                     for h in ui.iter_hours_for_day(day):
                         if self.stop_evt.is_set():
@@ -469,11 +474,6 @@ class Worker(threading.Thread):
 
                         used, total = slots[slot_key]
                         if used >= total:
-                            continue
-
-                        if skip_slot_once == (day.isoformat(), slot_key):
-                            ui.log(f"[SAFE] Pomijam 1x po recovery: {day.isoformat()} {slot_key}")
-                            skip_slot_once = None
                             continue
 
                         ui.log(f"[TRY] {day.isoformat()} {slot_key} {used}/{total}")
@@ -500,6 +500,7 @@ class Worker(threading.Thread):
                                         click_standardowe(page, load_to)
                                     else:
                                         click_day_by_coordinates(page, day, load_to)
+                                skip_day_once = day.isoformat()
                             continue
 
                         if outcome == "CLOUDFLARE":
@@ -518,8 +519,8 @@ class Worker(threading.Thread):
                             else:
                                 ui.log("[WARN] Nie udało się zrobić refreshu przez zmianę dnia po recovery.")
 
-                            skip_slot_once = (day.isoformat(), slot_key)
-                            ui.log(f"[SAFE] Po recovery pominę 1x slot: {slot_key}")
+                            skip_day_once = day.isoformat()
+                            ui.log(f"[SAFE] Po recovery pominę 1x cały dzień: {day.isoformat()}")
                             break
 
                         if outcome == "SUCCESS":
@@ -570,7 +571,6 @@ class Worker(threading.Thread):
             # bez czekania na pełne dociągnięcie UI.
             confirm_loop_fast(page, max_clicks=60)
 
-            cloudflare_hits = 0
             loading_started = None
             deadline = time.time() + max(2.0, float(load_to) / 1000.0 + 1.0)
 
@@ -582,9 +582,7 @@ class Worker(threading.Thread):
                 if toast_edited_by_other_user(page):
                     return "EDITED_BY_OTHER"
                 if toast_cloudflare(page):
-                    cloudflare_hits += 1
-                    if cloudflare_hits >= 2:
-                        return "CLOUDFLARE"
+                    return "CLOUDFLARE"
                 if loading_slots_visible(page):
                     if loading_started is None:
                         loading_started = time.time()
@@ -856,16 +854,13 @@ class App(tk.Tk):
             return
 
         if not self.sound_enabled:
-            self.log(f"[TEST] {cfg['label']} - globalny DZWIEK jest OFF")
             return
 
         if not cfg["enabled"]:
-            self.log(f"[TEST] {cfg['label']} - to powiadomienie jest OFF")
             return
 
         sound_file = cfg["file"].get().strip()
         if not sound_file or sound_file == "brak":
-            self.log(f"[TEST] {cfg['label']} - brak wybranego pliku")
             return
 
         self.play_sound_file_once(sound_file, cfg["label"], int(cfg["volume"].get()))
@@ -874,11 +869,9 @@ class App(tk.Tk):
         try:
             p = Path(sound_file)
             if not p.exists():
-                self.log(f"[TEST] {label} - plik nie istnieje: {sound_file}")
                 return
 
             if platform.system() != "Windows":
-                self.log(f"[TEST] {label} - odtwarzanie działa tylko na Windows")
                 return
 
             # Odtwarzanie plików (mp3/wav/inne wspierane przez MediaPlayer)
@@ -902,13 +895,10 @@ class App(tk.Tk):
                 timeout=30,
             )
             if res.returncode != 0:
-                self.log(f"[TEST] {label} - nie udało się odtworzyć pliku")
                 return
 
-            self.log(f"[TEST] {label} - odtworzono 1 raz")
-
-        except Exception as e:
-            self.log(f"[TEST] {label} - błąd odtwarzania: {e}")
+        except Exception:
+            return
 
     def is_notification_sound_enabled(self, key):
         cfg = self.notification_settings.get(key)
