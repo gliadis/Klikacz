@@ -217,7 +217,7 @@ def toast_edited_by_other_user(page):
 
 
 def toast_cloudflare(page):
-    """Wykrycie komunikatu Cloudflare (różne warianty renderu)."""
+    """Wykrycie komunikatu Cloudflare (różne warianty renderu, także toastów)."""
     patterns = [
         "text=/Cloudflare error occurred/i",
         "text=/Please try again/i",
@@ -231,6 +231,25 @@ def toast_cloudflare(page):
                     if loc.is_visible():
                         return True
                 except Exception:
+                    return True
+        except Exception:
+            pass
+
+    # Dodatkowe źródła: typowe kontenery toast/notification.
+    toast_selectors = [
+        "[class*='toast']",
+        "[class*='Toast']",
+        "[class*='notification']",
+        "[class*='Notification']",
+        "[aria-live='polite']",
+        "[aria-live='assertive']",
+    ]
+    for sel in toast_selectors:
+        try:
+            texts = page.locator(sel).all_inner_texts()
+            for txt in texts:
+                low = (txt or "").lower()
+                if "cloudflare" in low or "please try again" in low:
                     return True
         except Exception:
             pass
@@ -553,6 +572,7 @@ class Worker(threading.Thread):
 
                         if outcome == "EDITED_BY_OTHER":
                             ui.log("[INFO] Awizacja edytowana przez innego użytkownika (1/2) – ponawiam kliknięcie.")
+                            time.sleep(0.45)
                             outcome_retry = self.try_slot(page, slot_key, load_to, success_to)
                             if outcome_retry == "SUCCESS":
                                 ui.emit_notification("slot_success")
@@ -1004,20 +1024,12 @@ class App(tk.Tk):
             sound_file = str(cfg["file"].get()).strip()
             volume = int(cfg["volume"].get())
 
-            self.log(
-                f"[NOTIFY] {cfg['label']} ON | glosnosc={int(cfg['volume'].get())} | plik={cfg['file'].get()}"
-            )
-
             if sound_file and sound_file != "brak":
                 threading.Thread(
                     target=self.play_sound_file_once,
                     args=(sound_file, cfg["label"], volume),
                     daemon=True,
                 ).start()
-            else:
-                self.log(f"[NOTIFY] {cfg['label']} - brak wybranego pliku")
-        else:
-            self.log(f"[NOTIFY] {cfg['label']} wyciszone")
 
     def save_settings(self):
         try:
