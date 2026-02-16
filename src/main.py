@@ -217,12 +217,33 @@ def toast_edited_by_other_user(page):
 
 
 def toast_cloudflare(page):
-    """Toast: Cloudflare error occurred."""
+    """Wykrycie komunikatu Cloudflare (różne warianty renderu)."""
+    patterns = [
+        "text=/Cloudflare error occurred/i",
+        "text=/Please try again/i",
+        "text=/cloudflare/i",
+    ]
+    for sel in patterns:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                try:
+                    if loc.is_visible():
+                        return True
+                except Exception:
+                    return True
+        except Exception:
+            pass
+
+    # Fallback: czasem toast znika bardzo szybko lub jest renderowany w inny sposób.
     try:
-        loc = page.locator("text=/Cloudflare error occurred/i").first
-        return loc.count() > 0 and loc.is_visible()
+        body_txt = (page.locator("body").inner_text(timeout=250) or "").lower()
+        if "cloudflare" in body_txt:
+            return True
     except Exception:
-        return False
+        pass
+
+    return False
 
 
 def loading_slots_visible(page):
@@ -460,10 +481,17 @@ class Worker(threading.Thread):
             ensure_slot_screen(page)
 
             skip_day_once = None
+            empty_slots_since = None
             while not self.stop_evt.is_set():
                 for day in days:
                     if self.stop_evt.is_set():
                         return
+
+                    if toast_cloudflare(page):
+                        if self.recover_from_cloudflare(page, day, load_to):
+                            skip_day_once = day.isoformat()
+                            ui.log(f"[SAFE] Po recovery pominę 1x cały dzień: {day.isoformat()}")
+                        continue
 
                     # 1) ZAWSZE ustaw właściwy dzień
                     if not ensure_day_selected(page, day, load_to):
@@ -483,6 +511,18 @@ class Worker(threading.Thread):
                         continue
 
                     slots = fast_read_slots(page)
+
+                    if not slots:
+                        if empty_slots_since is None:
+                            empty_slots_since = time.time()
+                        elif (time.time() - empty_slots_since) >= 20.0:
+                            ui.log("[WARN] Brak odczytu slotów przez >=20s. Traktuję jako stuck loading i robię recovery.")
+                            if self.recover_from_cloudflare(page, day, load_to):
+                                skip_day_once = day.isoformat()
+                                ui.log(f"[SAFE] Po recovery pominę 1x cały dzień: {day.isoformat()}")
+                            continue
+                    else:
+                        empty_slots_since = None
 
                     if skip_day_once == day.isoformat():
                         ui.log(f"[SAFE] Pomijam 1x cały dzień po recovery: {day.isoformat()}")
@@ -530,27 +570,9 @@ class Worker(threading.Thread):
                             continue
 
                         if outcome == "CLOUDFLARE":
-                            selected = ui.selected_container.get().strip()
-                            ui.log("[WARN] Wykryto Cloudflare error. Natychmiastowe wyjście z modala i powrót do listy kontenerów.")
-                            if selected and selected != "(brak)":
-                                ui.log(f"[INFO] Wybrany kontener (UI): {selected}")
-
-                            if force_back_to_container_list(page, self.stop_evt, attempts=4):
-                                ui.log("[INFO] Zamknięto modal i wrócono do listy kontenerów. Otwórz ręcznie Edytuj wybranego kontenera.")
-                            else:
-                                ui.log("[WARN] Nie udało się wyjść do listy kontenerów. Użyj ręcznie Anuluj/Escape.")
-
-                            if not wait_until_slot_screen(page, self.stop_evt, timeout_s=180):
-                                ui.log("[WARN] Timeout oczekiwania na ponowne otwarcie slotów (Edytuj).")
-                                continue
-
-                            if refresh_by_day_toggle(page, day, load_to):
-                                ui.log("[INFO] Po recovery wykonano refresh przez zmianę dnia i powrót.")
-                            else:
-                                ui.log("[WARN] Nie udało się zrobić refreshu przez zmianę dnia po recovery.")
-
-                            skip_day_once = day.isoformat()
-                            ui.log(f"[SAFE] Po recovery pominę 1x cały dzień: {day.isoformat()}")
+                            if self.recover_from_cloudflare(page, day, load_to):
+                                skip_day_once = day.isoformat()
+                                ui.log(f"[SAFE] Po recovery pominę 1x cały dzień: {day.isoformat()}")
                             break
 
                         if outcome == "SUCCESS":
@@ -559,6 +581,29 @@ class Worker(threading.Thread):
                             return
 
                 time.sleep(max(0.05, float(poll_s)))
+
+    def recover_from_cloudflare(self, page, day, load_to):
+        ui = self.ui
+        selected = ui.selected_container.get().strip()
+        ui.log("[WARN] Wykryto Cloudflare/stuck loading. Natychmiastowe wyjście z modala i powrót do listy kontenerów.")
+        if selected and selected != "(brak)":
+            ui.log(f"[INFO] Wybrany kontener (UI): {selected}")
+
+        if force_back_to_container_list(page, self.stop_evt, attempts=5):
+            ui.log("[INFO] Zamknięto modal i wrócono do listy kontenerów. Otwórz ręcznie Edytuj wybranego kontenera.")
+        else:
+            ui.log("[WARN] Nie udało się wyjść do listy kontenerów. Użyj ręcznie Anuluj/Escape.")
+
+        if not wait_until_slot_screen(page, self.stop_evt, timeout_s=180):
+            ui.log("[WARN] Timeout oczekiwania na ponowne otwarcie slotów (Edytuj).")
+            return False
+
+        if refresh_by_day_toggle(page, day, load_to):
+            ui.log("[INFO] Po recovery wykonano refresh przez zmianę dnia i powrót.")
+        else:
+            ui.log("[WARN] Nie udało się zrobić refreshu przez zmianę dnia po recovery.")
+
+        return True
 
     def try_slot(self, page, slot_key, load_to, success_to):
         """
