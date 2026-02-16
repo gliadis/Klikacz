@@ -48,6 +48,7 @@ LICENSE_HTTP_TIMEOUT_S = 8
 # ------------------ REGEX ------------------
 
 SLOT_RE = re.compile(r"(\d{2}:\d{2})-(\d{2}:\d{2})\s+(\d+)/(\d+)")
+CONTAINER_RE = re.compile(r"\b[A-Z]{3,4}\d{6,8}\b")
 
 
 # ------------------ LICENSE / MACHINE ID ------------------
@@ -155,6 +156,16 @@ def wait_until_slot_screen(page, stop_evt, timeout_s=180):
     return is_slot_screen(page)
 
 
+def wait_until_not_slot_screen(page, stop_evt, timeout_s=8):
+    """Czekaj aż zniknie ekran slotów (powrót do listy kontenerów)."""
+    deadline = time.time() + float(timeout_s)
+    while not stop_evt.is_set() and time.time() < deadline:
+        if not is_slot_screen(page):
+            return True
+        time.sleep(0.20)
+    return not is_slot_screen(page)
+
+
 def fast_read_slots(page):
     """Zwraca dict: { 'HH:MM-HH:MM': (used, total) }"""
     out = {}
@@ -240,6 +251,21 @@ def click_anuluj(page):
         except Exception:
             pass
     return False
+
+
+def force_back_to_container_list(page, stop_evt, attempts=3):
+    """Próby zamknięcia modala slotów i powrotu do listy kontenerów."""
+    for _ in range(max(1, int(attempts))):
+        click_anuluj(page)
+        if wait_until_not_slot_screen(page, stop_evt, timeout_s=3):
+            return True
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        if wait_until_not_slot_screen(page, stop_evt, timeout_s=2):
+            return True
+    return wait_until_not_slot_screen(page, stop_evt, timeout_s=2)
 
 
 def success_visible(page):
@@ -504,11 +530,15 @@ class Worker(threading.Thread):
                             continue
 
                         if outcome == "CLOUDFLARE":
-                            ui.log("[WARN] Wykryto Cloudflare error. Próba recovery (Anuluj + oczekiwanie na ręczne Edytuj).")
-                            if click_anuluj(page):
-                                ui.log("[INFO] Kliknięto 'Anuluj'. Czekam aż użytkownik ponownie otworzy okna (Edytuj).")
+                            selected = ui.selected_container.get().strip()
+                            ui.log("[WARN] Wykryto Cloudflare error. Natychmiastowe wyjście z modala i powrót do listy kontenerów.")
+                            if selected and selected != "(brak)":
+                                ui.log(f"[INFO] Wybrany kontener (UI): {selected}")
+
+                            if force_back_to_container_list(page, self.stop_evt, attempts=4):
+                                ui.log("[INFO] Zamknięto modal i wrócono do listy kontenerów. Otwórz ręcznie Edytuj wybranego kontenera.")
                             else:
-                                ui.log("[WARN] Nie udało się kliknąć 'Anuluj'. Czekam na powrót ekranu slotów.")
+                                ui.log("[WARN] Nie udało się wyjść do listy kontenerów. Użyj ręcznie Anuluj/Escape.")
 
                             if not wait_until_slot_screen(page, self.stop_evt, timeout_s=180):
                                 ui.log("[WARN] Timeout oczekiwania na ponowne otwarcie slotów (Edytuj).")
@@ -661,6 +691,8 @@ class App(tk.Tk):
 
         # Prosty stan ON/OFF (bez efektu dźwiękowego na tym etapie).
         self.sound_enabled = True
+        self.selected_container = tk.StringVar(value="(brak)")
+        self.container_values = ["(brak)"]
 
         # domyślny zakres: następna pełna godzina -> +1h
         now = dt.datetime.now()
@@ -700,6 +732,18 @@ class App(tk.Tk):
         )
         self.sound_btn.pack(side="left", padx=5)
         self.update_sound_button_style()
+
+        ttk.Label(b, text="Kontener:").pack(side="left", padx=(10, 4))
+        self.container_combo = ttk.Combobox(
+            b,
+            textvariable=self.selected_container,
+            values=self.container_values,
+            width=18,
+            state="readonly",
+        )
+        self.container_combo.pack(side="left", padx=(0, 4))
+        self.container_combo.bind("<<ComboboxSelected>>", lambda _e: self.save_settings())
+        ttk.Button(b, text="ODSWIEZ", command=self.refresh_container_list).pack(side="left", padx=3)
 
         self.log_box = tk.Text(f, height=16)
         self.log_box.pack(fill="both", expand=True, padx=10, pady=5)
@@ -934,6 +978,7 @@ class App(tk.Tk):
         try:
             payload = {
                 "sound_enabled": self.sound_enabled,
+                "selected_container": str(self.selected_container.get()),
                 "notifications": {},
             }
             for key, cfg in self.notification_settings.items():
@@ -961,6 +1006,9 @@ class App(tk.Tk):
 
             self.sound_enabled = bool(data.get("sound_enabled", self.sound_enabled))
             self.update_sound_button_style()
+            saved_container = str(data.get("selected_container", self.selected_container.get()))
+            if saved_container:
+                self.selected_container.set(saved_container)
 
             incoming = data.get("notifications", {})
             for key, cfg in self.notification_settings.items():
@@ -1028,6 +1076,42 @@ class App(tk.Tk):
     def log(self, msg):
         self.log_box.insert("end", msg + "\n")
         self.log_box.see("end")
+
+    def set_container_values(self, values):
+        vals = list(values) if values else ["(brak)"]
+        self.container_values = vals
+        self.container_combo["values"] = vals
+        cur = self.selected_container.get()
+        if cur not in vals:
+            self.selected_container.set(vals[0])
+
+    def refresh_container_list(self):
+        """Odczytaj widoczne kontenery z aktualnej strony i odśwież listę wyboru."""
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                ctx = browser.contexts[0]
+                page = ctx.pages[0]
+                texts = page.locator("body").all_inner_texts()
+        except Exception as e:
+            self.log(f"[WARN] Nie udało się odświeżyć listy kontenerów: {e}")
+            return
+
+        found = []
+        seen = set()
+        for t in texts:
+            for m in CONTAINER_RE.findall(t.upper()):
+                if m not in seen:
+                    seen.add(m)
+                    found.append(m)
+
+        if not found:
+            self.set_container_values(["(brak)"])
+            self.log("[INFO] Nie znaleziono kontenerów na stronie (odśwież ręcznie).")
+            return
+
+        self.set_container_values(found)
+        self.log(f"[UI] Odswiezono liste kontenerow ({len(found)}).")
 
     def popup(self, title, msg):
         self.after(0, lambda: messagebox.showerror(title, msg))
@@ -1138,6 +1222,7 @@ class App(tk.Tk):
     # ---------- controls ----------
 
     def start(self):
+        self.refresh_container_list()
         self.emit_notification("start_stop")
 
         # START ma sprawdzić licencję i zamknąć program jeśli nieważna
