@@ -380,6 +380,20 @@ def ensure_day_selected(page, day: dt.date, load_to: int, tries: int = 5):
     return False
 
 
+def refresh_by_day_toggle(page, day: dt.date, load_to: int):
+    """
+    Jednorazowy refresh przez zmianę dnia i powrót do docelowego dnia.
+    Najpierw próba dzień+1, potem dzień-1.
+    """
+    neighbors = [day + dt.timedelta(days=1), day - dt.timedelta(days=1)]
+    for other in neighbors:
+        if click_day_by_coordinates(page, other, load_to):
+            time.sleep(0.10)
+            if click_day_by_coordinates(page, day, load_to):
+                return True
+    return False
+
+
 # ------------------ WORKER ------------------
 
 class Worker(threading.Thread):
@@ -479,11 +493,13 @@ class Worker(threading.Thread):
                                 ui.log("[SUCCESS] Awizacja utworzona (wysłane do kierowcy).")
                                 return
                             if outcome_retry == "EDITED_BY_OTHER":
-                                ui.log("[INFO] Awizacja edytowana przez innego użytkownika (2/2) – odświeżam listę okienek.")
-                                if len(days) == 1:
-                                    click_standardowe(page, load_to)
-                                else:
-                                    click_day_by_coordinates(page, day, load_to)
+                                ui.log("[INFO] Awizacja edytowana przez innego użytkownika (2/2) – refresh przez zmianę dnia i powrót.")
+                                if not refresh_by_day_toggle(page, day, load_to):
+                                    ui.log("[WARN] Refresh przez zmianę dnia nieudany – fallback STANDARDOWE.")
+                                    if len(days) == 1:
+                                        click_standardowe(page, load_to)
+                                    else:
+                                        click_day_by_coordinates(page, day, load_to)
                             continue
 
                         if outcome == "CLOUDFLARE":
@@ -496,6 +512,11 @@ class Worker(threading.Thread):
                             if not wait_until_slot_screen(page, self.stop_evt, timeout_s=180):
                                 ui.log("[WARN] Timeout oczekiwania na ponowne otwarcie slotów (Edytuj).")
                                 continue
+
+                            if refresh_by_day_toggle(page, day, load_to):
+                                ui.log("[INFO] Po recovery wykonano refresh przez zmianę dnia i powrót.")
+                            else:
+                                ui.log("[WARN] Nie udało się zrobić refreshu przez zmianę dnia po recovery.")
 
                             skip_slot_once = (day.isoformat(), slot_key)
                             ui.log(f"[SAFE] Po recovery pominę 1x slot: {slot_key}")
