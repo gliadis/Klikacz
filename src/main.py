@@ -48,6 +48,7 @@ LICENSE_HTTP_TIMEOUT_S = 8
 # ------------------ REGEX ------------------
 
 SLOT_RE = re.compile(r"(\d{2}:\d{2})-(\d{2}:\d{2})\s+(\d+)/(\d+)")
+CONTAINER_RE = re.compile(r"\b[A-Z]{3,4}\d{6,8}\b")
 
 
 # ------------------ LICENSE / MACHINE ID ------------------
@@ -127,17 +128,42 @@ def wait_for_slots_loaded(page, timeout_ms):
 
 def ensure_slot_screen(page):
     """Sprawdza, czy jesteśmy na ekranie wyboru slotów."""
-    try:
-        has_std = page.locator("text=STANDARDOWE").count() > 0
-        has_slot = page.locator(r"text=/\b\d{2}:\d{2}-\d{2}:\d{2}\b/").count() > 0
-        if has_std and has_slot:
-            return
-    except Exception:
-        pass
+    if is_slot_screen(page):
+        return
     raise RuntimeError(
         "Nie jestem na ekranie wyboru okienek (slotów). "
         "Otwórz awizację w widoku slotów (kalendarz + siatka slotów) i dopiero kliknij START."
     )
+
+
+def is_slot_screen(page):
+    """Czy aktualnie widoczny jest ekran wyboru slotów."""
+    try:
+        has_std = page.locator("text=STANDARDOWE").count() > 0
+        has_slot = page.locator(r"text=/\b\d{2}:\d{2}-\d{2}:\d{2}\b/").count() > 0
+        return bool(has_std and has_slot)
+    except Exception:
+        return False
+
+
+def wait_until_slot_screen(page, stop_evt, timeout_s=180):
+    """Czekaj aż użytkownik ponownie otworzy okno z kalendarzem i slotami."""
+    deadline = time.time() + float(timeout_s)
+    while not stop_evt.is_set() and time.time() < deadline:
+        if is_slot_screen(page):
+            return True
+        time.sleep(0.20)
+    return is_slot_screen(page)
+
+
+def wait_until_not_slot_screen(page, stop_evt, timeout_s=8):
+    """Czekaj aż zniknie ekran slotów (powrót do listy kontenerów)."""
+    deadline = time.time() + float(timeout_s)
+    while not stop_evt.is_set() and time.time() < deadline:
+        if not is_slot_screen(page):
+            return True
+        time.sleep(0.20)
+    return not is_slot_screen(page)
 
 
 def fast_read_slots(page):
@@ -179,6 +205,88 @@ def toast_no_slots(page):
     except Exception:
         pass
     return False
+
+
+def toast_edited_by_other_user(page):
+    """Toast: awizacja edytowana przez innego użytkownika."""
+    try:
+        loc = page.locator("text=/Awizacja edytowana przez innego użytkownika/i").first
+        return loc.count() > 0 and loc.is_visible()
+    except Exception:
+        return False
+
+
+def toast_cloudflare(page):
+    """Wykrycie komunikatu Cloudflare (różne warianty renderu)."""
+    patterns = [
+        "text=/Cloudflare error occurred/i",
+        "text=/Please try again/i",
+        "text=/cloudflare/i",
+    ]
+    for sel in patterns:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                try:
+                    if loc.is_visible():
+                        return True
+                except Exception:
+                    return True
+        except Exception:
+            pass
+
+    # Fallback: czasem toast znika bardzo szybko lub jest renderowany w inny sposób.
+    try:
+        body_txt = (page.locator("body").inner_text(timeout=250) or "").lower()
+        if "cloudflare" in body_txt:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def loading_slots_visible(page):
+    """Czy UI pokazuje trwające ładowanie slotów."""
+    try:
+        loc = page.locator("text=Ładowanie slotów").first
+        return loc.count() > 0 and loc.is_visible()
+    except Exception:
+        return False
+
+
+def click_anuluj(page):
+    """Best-effort kliknięcie Anuluj na modalu awizacji."""
+    selectors = [
+        "button:has-text('Anuluj')",
+        "[role='button']:has-text('Anuluj')",
+        "a:has-text('Anuluj')",
+        "text=/^\s*Anuluj\s*$/i",
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() and el.is_visible():
+                el.click(timeout=1200)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def force_back_to_container_list(page, stop_evt, attempts=3):
+    """Próby zamknięcia modala slotów i powrotu do listy kontenerów."""
+    for _ in range(max(1, int(attempts))):
+        click_anuluj(page)
+        if wait_until_not_slot_screen(page, stop_evt, timeout_s=3):
+            return True
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        if wait_until_not_slot_screen(page, stop_evt, timeout_s=2):
+            return True
+    return wait_until_not_slot_screen(page, stop_evt, timeout_s=2)
 
 
 def success_visible(page):
@@ -319,6 +427,20 @@ def ensure_day_selected(page, day: dt.date, load_to: int, tries: int = 5):
     return False
 
 
+def refresh_by_day_toggle(page, day: dt.date, load_to: int):
+    """
+    Jednorazowy refresh przez zmianę dnia i powrót do docelowego dnia.
+    Najpierw próba dzień+1, potem dzień-1.
+    """
+    neighbors = [day + dt.timedelta(days=1), day - dt.timedelta(days=1)]
+    for other in neighbors:
+        if click_day_by_coordinates(page, other, load_to):
+            time.sleep(0.10)
+            if click_day_by_coordinates(page, day, load_to):
+                return True
+    return False
+
+
 # ------------------ WORKER ------------------
 
 class Worker(threading.Thread):
@@ -358,10 +480,18 @@ class Worker(threading.Thread):
             ui.log(f"[OK] Strona: {page.url}")
             ensure_slot_screen(page)
 
+            skip_day_once = None
+            empty_slots_since = None
             while not self.stop_evt.is_set():
                 for day in days:
                     if self.stop_evt.is_set():
                         return
+
+                    if toast_cloudflare(page):
+                        if self.recover_from_cloudflare(page, day, load_to):
+                            skip_day_once = day.isoformat()
+                            ui.log(f"[SAFE] Po recovery pominę 1x cały dzień: {day.isoformat()}")
+                        continue
 
                     # 1) ZAWSZE ustaw właściwy dzień
                     if not ensure_day_selected(page, day, load_to):
@@ -382,6 +512,23 @@ class Worker(threading.Thread):
 
                     slots = fast_read_slots(page)
 
+                    if not slots:
+                        if empty_slots_since is None:
+                            empty_slots_since = time.time()
+                        elif (time.time() - empty_slots_since) >= 20.0:
+                            ui.log("[WARN] Brak odczytu slotów przez >=20s. Traktuję jako stuck loading i robię recovery.")
+                            if self.recover_from_cloudflare(page, day, load_to):
+                                skip_day_once = day.isoformat()
+                                ui.log(f"[SAFE] Po recovery pominę 1x cały dzień: {day.isoformat()}")
+                            continue
+                    else:
+                        empty_slots_since = None
+
+                    if skip_day_once == day.isoformat():
+                        ui.log(f"[SAFE] Pomijam 1x cały dzień po recovery: {day.isoformat()}")
+                        skip_day_once = None
+                        continue
+
                     # 4) Sprawdź sloty tylko dla tego dnia i dla zakresu godzin
                     for h in ui.iter_hours_for_day(day):
                         if self.stop_evt.is_set():
@@ -392,28 +539,76 @@ class Worker(threading.Thread):
                             continue
 
                         used, total = slots[slot_key]
-                        if used < total:
-                            ui.log(f"[TRY] {day.isoformat()} {slot_key} {used}/{total}")
+                        if used >= total:
+                            continue
 
-                            # klik slot + potwierdzenia
-                            self.try_slot(page, slot_key, load_to, success_to)
+                        ui.log(f"[TRY] {day.isoformat()} {slot_key} {used}/{total}")
 
-                            # jeśli toast "brak slotów" -> wracamy do odświeżania
-                            if toast_no_slots(page):
-                                ui.log("[INFO] Toast 'Brak dostępnych slotów' – kontynuuję odświeżanie.")
-                                continue
+                        # klik slot + potwierdzenia
+                        outcome = self.try_slot(page, slot_key, load_to, success_to)
 
-                            # sukces tylko po komunikacie o wysłaniu do kierowcy
-                            if success_confirmed(page, success_to):
+                        if outcome == "NO_SLOTS":
+                            ui.log("[INFO] Toast 'Brak dostępnych slotów' – kontynuuję odświeżanie.")
+                            continue
+
+                        if outcome == "EDITED_BY_OTHER":
+                            ui.log("[INFO] Awizacja edytowana przez innego użytkownika (1/2) – ponawiam kliknięcie.")
+                            outcome_retry = self.try_slot(page, slot_key, load_to, success_to)
+                            if outcome_retry == "SUCCESS":
                                 ui.emit_notification("slot_success")
                                 ui.log("[SUCCESS] Awizacja utworzona (wysłane do kierowcy).")
                                 return
+                            if outcome_retry == "EDITED_BY_OTHER":
+                                ui.log("[INFO] Awizacja edytowana przez innego użytkownika (2/2) – refresh przez zmianę dnia i powrót.")
+                                if not refresh_by_day_toggle(page, day, load_to):
+                                    ui.log("[WARN] Refresh przez zmianę dnia nieudany – fallback STANDARDOWE.")
+                                    if len(days) == 1:
+                                        click_standardowe(page, load_to)
+                                    else:
+                                        click_day_by_coordinates(page, day, load_to)
+                                skip_day_once = day.isoformat()
+                            continue
+
+                        if outcome == "CLOUDFLARE":
+                            if self.recover_from_cloudflare(page, day, load_to):
+                                skip_day_once = day.isoformat()
+                                ui.log(f"[SAFE] Po recovery pominę 1x cały dzień: {day.isoformat()}")
+                            break
+
+                        if outcome == "SUCCESS":
+                            ui.emit_notification("slot_success")
+                            ui.log("[SUCCESS] Awizacja utworzona (wysłane do kierowcy).")
+                            return
 
                 time.sleep(max(0.05, float(poll_s)))
+
+    def recover_from_cloudflare(self, page, day, load_to):
+        ui = self.ui
+        selected = ui.selected_container.get().strip()
+        ui.log("[WARN] Wykryto Cloudflare/stuck loading. Natychmiastowe wyjście z modala i powrót do listy kontenerów.")
+        if selected and selected != "(brak)":
+            ui.log(f"[INFO] Wybrany kontener (UI): {selected}")
+
+        if force_back_to_container_list(page, self.stop_evt, attempts=5):
+            ui.log("[INFO] Zamknięto modal i wrócono do listy kontenerów. Otwórz ręcznie Edytuj wybranego kontenera.")
+        else:
+            ui.log("[WARN] Nie udało się wyjść do listy kontenerów. Użyj ręcznie Anuluj/Escape.")
+
+        if not wait_until_slot_screen(page, self.stop_evt, timeout_s=180):
+            ui.log("[WARN] Timeout oczekiwania na ponowne otwarcie slotów (Edytuj).")
+            return False
+
+        if refresh_by_day_toggle(page, day, load_to):
+            ui.log("[INFO] Po recovery wykonano refresh przez zmianę dnia i powrót.")
+        else:
+            ui.log("[WARN] Nie udało się zrobić refreshu przez zmianę dnia po recovery.")
+
+        return True
 
     def try_slot(self, page, slot_key, load_to, success_to):
         """
         Kliknięcie slotu + agresywna pętla potwierdzeń TAK/OK (v4.2.3).
+        Zwraca status: SUCCESS | NO_SLOTS | EDITED_BY_OTHER | CLOUDFLARE | RETRY.
         """
         try:
             # Preferujemy button/a/role=button zawierające slot_key
@@ -429,7 +624,7 @@ class Worker(threading.Thread):
 
             if n == 0:
                 self.ui.log(f"[WARN] Nie znalazłem kafelka dla slotu: {slot_key}")
-                return
+                return "RETRY"
 
             clicked = False
             for i in range(min(n, 12)):
@@ -445,25 +640,54 @@ class Worker(threading.Thread):
 
             if not clicked:
                 self.ui.log(f"[WARN] Kafelek slotu jest, ale nie udało się kliknąć: {slot_key}")
-                return
+                return "RETRY"
 
             # Faza 1 (ultra-fast): od razu próbujemy klikać dialogi,
             # bez czekania na pełne dociągnięcie UI.
             confirm_loop_fast(page, max_clicks=60)
 
+            loading_started = None
+            deadline = time.time() + max(2.0, float(load_to) / 1000.0 + 1.0)
+
+            while time.time() < deadline:
+                if success_visible(page) or success_confirmed(page, 120):
+                    return "SUCCESS"
+                if toast_no_slots(page):
+                    return "NO_SLOTS"
+                if toast_edited_by_other_user(page):
+                    return "EDITED_BY_OTHER"
+                if toast_cloudflare(page):
+                    return "CLOUDFLARE"
+                if loading_slots_visible(page):
+                    if loading_started is None:
+                        loading_started = time.time()
+                    elif (time.time() - loading_started) >= 15.0:
+                        return "CLOUDFLARE"
+                else:
+                    loading_started = None
+
+                # domykanie ewentualnych popupów
+                confirm_loop_fast(page, max_clicks=4)
+                time.sleep(0.08)
+
             # Faza 2: jeśli UI jeszcze ładuje, dokończ po załadowaniu.
             wait_for_slots_loaded(page, load_to)
-            confirm_loop_fast(page, max_clicks=40)
+            confirm_loop_fast(page, max_clicks=30)
 
-            # jeśli sukces pojawi się szybko, kończymy od razu
-            if success_visible(page):
-                return
+            if success_visible(page) or success_confirmed(page, min(800, int(success_to))):
+                return "SUCCESS"
+            if toast_no_slots(page):
+                return "NO_SLOTS"
+            if toast_edited_by_other_user(page):
+                return "EDITED_BY_OTHER"
+            if toast_cloudflare(page):
+                return "CLOUDFLARE"
 
-            # dodatkowo: jeszcze krótko poczekaj na sukces (minimalnie)
-            success_confirmed(page, min(800, int(success_to)))
+            return "RETRY"
 
         except Exception as e:
             self.ui.log(f"[WARN] Kliknięcie slotu nie powiodło się: {e}")
+            return "RETRY"
 
 
 # ------------------ UI ------------------
@@ -512,6 +736,8 @@ class App(tk.Tk):
 
         # Prosty stan ON/OFF (bez efektu dźwiękowego na tym etapie).
         self.sound_enabled = True
+        self.selected_container = tk.StringVar(value="(brak)")
+        self.container_values = ["(brak)"]
 
         # domyślny zakres: następna pełna godzina -> +1h
         now = dt.datetime.now()
@@ -551,6 +777,18 @@ class App(tk.Tk):
         )
         self.sound_btn.pack(side="left", padx=5)
         self.update_sound_button_style()
+
+        ttk.Label(b, text="Kontener:").pack(side="left", padx=(10, 4))
+        self.container_combo = ttk.Combobox(
+            b,
+            textvariable=self.selected_container,
+            values=self.container_values,
+            width=18,
+            state="readonly",
+        )
+        self.container_combo.pack(side="left", padx=(0, 4))
+        self.container_combo.bind("<<ComboboxSelected>>", lambda _e: self.save_settings())
+        ttk.Button(b, text="ODSWIEZ", command=self.refresh_container_list).pack(side="left", padx=3)
 
         self.log_box = tk.Text(f, height=16)
         self.log_box.pack(fill="both", expand=True, padx=10, pady=5)
@@ -705,16 +943,13 @@ class App(tk.Tk):
             return
 
         if not self.sound_enabled:
-            self.log(f"[TEST] {cfg['label']} - globalny DZWIEK jest OFF")
             return
 
         if not cfg["enabled"]:
-            self.log(f"[TEST] {cfg['label']} - to powiadomienie jest OFF")
             return
 
         sound_file = cfg["file"].get().strip()
         if not sound_file or sound_file == "brak":
-            self.log(f"[TEST] {cfg['label']} - brak wybranego pliku")
             return
 
         self.play_sound_file_once(sound_file, cfg["label"], int(cfg["volume"].get()))
@@ -723,11 +958,9 @@ class App(tk.Tk):
         try:
             p = Path(sound_file)
             if not p.exists():
-                self.log(f"[TEST] {label} - plik nie istnieje: {sound_file}")
                 return
 
             if platform.system() != "Windows":
-                self.log(f"[TEST] {label} - odtwarzanie działa tylko na Windows")
                 return
 
             # Odtwarzanie plików (mp3/wav/inne wspierane przez MediaPlayer)
@@ -751,13 +984,10 @@ class App(tk.Tk):
                 timeout=30,
             )
             if res.returncode != 0:
-                self.log(f"[TEST] {label} - nie udało się odtworzyć pliku")
                 return
 
-            self.log(f"[TEST] {label} - odtworzono 1 raz")
-
-        except Exception as e:
-            self.log(f"[TEST] {label} - błąd odtwarzania: {e}")
+        except Exception:
+            return
 
     def is_notification_sound_enabled(self, key):
         cfg = self.notification_settings.get(key)
@@ -793,6 +1023,7 @@ class App(tk.Tk):
         try:
             payload = {
                 "sound_enabled": self.sound_enabled,
+                "selected_container": str(self.selected_container.get()),
                 "notifications": {},
             }
             for key, cfg in self.notification_settings.items():
@@ -820,6 +1051,9 @@ class App(tk.Tk):
 
             self.sound_enabled = bool(data.get("sound_enabled", self.sound_enabled))
             self.update_sound_button_style()
+            saved_container = str(data.get("selected_container", self.selected_container.get()))
+            if saved_container:
+                self.selected_container.set(saved_container)
 
             incoming = data.get("notifications", {})
             for key, cfg in self.notification_settings.items():
@@ -887,6 +1121,42 @@ class App(tk.Tk):
     def log(self, msg):
         self.log_box.insert("end", msg + "\n")
         self.log_box.see("end")
+
+    def set_container_values(self, values):
+        vals = list(values) if values else ["(brak)"]
+        self.container_values = vals
+        self.container_combo["values"] = vals
+        cur = self.selected_container.get()
+        if cur not in vals:
+            self.selected_container.set(vals[0])
+
+    def refresh_container_list(self):
+        """Odczytaj widoczne kontenery z aktualnej strony i odśwież listę wyboru."""
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+                ctx = browser.contexts[0]
+                page = ctx.pages[0]
+                texts = page.locator("body").all_inner_texts()
+        except Exception as e:
+            self.log(f"[WARN] Nie udało się odświeżyć listy kontenerów: {e}")
+            return
+
+        found = []
+        seen = set()
+        for t in texts:
+            for m in CONTAINER_RE.findall(t.upper()):
+                if m not in seen:
+                    seen.add(m)
+                    found.append(m)
+
+        if not found:
+            self.set_container_values(["(brak)"])
+            self.log("[INFO] Nie znaleziono kontenerów na stronie (odśwież ręcznie).")
+            return
+
+        self.set_container_values(found)
+        self.log(f"[UI] Odswiezono liste kontenerow ({len(found)}).")
 
     def popup(self, title, msg):
         self.after(0, lambda: messagebox.showerror(title, msg))
@@ -997,6 +1267,7 @@ class App(tk.Tk):
     # ---------- controls ----------
 
     def start(self):
+        self.refresh_container_list()
         self.emit_notification("start_stop")
 
         # START ma sprawdzić licencję i zamknąć program jeśli nieważna
